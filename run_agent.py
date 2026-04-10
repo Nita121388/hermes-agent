@@ -4982,6 +4982,9 @@ class AIAgent:
                 logging.warning(
                     "Fallback to %s failed: provider not configured",
                     fb_provider)
+                self._emit_status(
+                    f"⚠️ Fallback {fb_provider} unavailable — provider not configured."
+                )
                 return self._try_activate_fallback()  # try next in chain
 
             # Determine api_mode from provider / base URL
@@ -4993,6 +4996,22 @@ class AIAgent:
                 fb_api_mode = "anthropic_messages"
             elif self._is_direct_openai_url(fb_base_url):
                 fb_api_mode = "codex_responses"
+            else:
+                # Keep Codex Responses mode when falling back across models on
+                # the same custom endpoint that already runs the primary in
+                # codex_responses. Some OpenAI-compatible gateways reject the
+                # same request in chat_completions mode with HTTP 403.
+                rt = getattr(self, "_primary_runtime", {}) or {}
+                primary_mode = str(rt.get("api_mode") or "")
+                primary_base = str(rt.get("base_url") or "").rstrip("/").lower()
+                fallback_base = fb_base_url.rstrip("/").lower()
+                if (
+                    fb_provider == "custom"
+                    and primary_mode == "codex_responses"
+                    and primary_base
+                    and fallback_base == primary_base
+                ):
+                    fb_api_mode = "codex_responses"
 
             old_model = self.model
             self.model = fb_model
@@ -5061,15 +5080,19 @@ class AIAgent:
 
             self._emit_status(
                 f"🔄 Primary model failed — switching to fallback: "
-                f"{fb_model} via {fb_provider}"
+                f"{fb_model} via {fb_provider} (mode={fb_api_mode})"
             )
             logging.info(
-                "Fallback activated: %s → %s (%s)",
-                old_model, fb_model, fb_provider,
+                "Fallback activated: %s → %s (%s, mode=%s)",
+                old_model, fb_model, fb_provider, fb_api_mode,
             )
             return True
         except Exception as e:
             logging.error("Failed to activate fallback %s: %s", fb_model, e)
+            self._emit_status(
+                f"⚠️ Fallback {fb_provider or 'provider'} failed: "
+                f"{self._clean_error_message(str(e))}"
+            )
             return self._try_activate_fallback()  # try next in chain
 
     # ── Per-turn primary restoration ─────────────────────────────────────
@@ -7556,7 +7579,53 @@ class AIAgent:
             
             api_start_time = time.time()
             retry_count = 0
-            max_retries = 3
+            # Allow operators to tune retry tolerance for flaky custom/proxy endpoints.
+            # Keep a bounded range to avoid runaway retry loops from bad env values.
+            _max_retries_raw = os.getenv("HERMES_API_MAX_RETRIES", "3")
+            try:
+                max_retries = int(_max_retries_raw)
+            except (TypeError, ValueError):
+                logging.warning(
+                    "%sInvalid HERMES_API_MAX_RETRIES=%r; falling back to 3.",
+                    self.log_prefix,
+                    _max_retries_raw,
+                )
+                max_retries = 3
+            max_retries = max(1, min(max_retries, 12))
+            _retry_jitter_raw = os.getenv("HERMES_RETRY_JITTER_PCT", "0.20")
+            try:
+                retry_jitter_pct = float(_retry_jitter_raw)
+            except (TypeError, ValueError):
+                logging.warning(
+                    "%sInvalid HERMES_RETRY_JITTER_PCT=%r; falling back to 0.20.",
+                    self.log_prefix,
+                    _retry_jitter_raw,
+                )
+                retry_jitter_pct = 0.20
+            retry_jitter_pct = max(0.0, min(retry_jitter_pct, 0.5))
+            _retry_max_backoff_raw = os.getenv("HERMES_RETRY_MAX_BACKOFF_SECONDS", "60")
+            try:
+                retry_max_backoff = int(_retry_max_backoff_raw)
+            except (TypeError, ValueError):
+                logging.warning(
+                    "%sInvalid HERMES_RETRY_MAX_BACKOFF_SECONDS=%r; falling back to 60.",
+                    self.log_prefix,
+                    _retry_max_backoff_raw,
+                )
+                retry_max_backoff = 60
+            retry_max_backoff = max(5, min(retry_max_backoff, 300))
+            _timeout_fallback_after_raw = os.getenv("HERMES_TIMEOUT_FALLBACK_AFTER", "3")
+            try:
+                timeout_fallback_after = int(_timeout_fallback_after_raw)
+            except (TypeError, ValueError):
+                logging.warning(
+                    "%sInvalid HERMES_TIMEOUT_FALLBACK_AFTER=%r; falling back to 3.",
+                    self.log_prefix,
+                    _timeout_fallback_after_raw,
+                )
+                timeout_fallback_after = 3
+            timeout_fallback_after = max(1, min(timeout_fallback_after, max_retries))
+            consecutive_timeout_failures = 0
             primary_recovery_attempted = False
             max_compression_attempts = 3
             codex_auth_retry_attempted=False
@@ -7779,7 +7848,12 @@ class AIAgent:
                         
                         # Longer backoff for rate limiting (likely cause of None choices)
                         # Jittered exponential: 5s base, 120s cap + random jitter
-                        wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                        wait_time = jittered_backoff(
+                            retry_count,
+                            base_delay=5.0,
+                            max_delay=float(max(120, retry_max_backoff)),
+                            jitter_ratio=retry_jitter_pct,
+                        )
                         self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time}s (extended backoff for possible rate limit)...", force=True)
                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                         
@@ -8089,6 +8163,7 @@ class AIAgent:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
                     
                     has_retried_429 = False  # Reset on success
+                    consecutive_timeout_failures = 0
                     self._touch_activity(f"API call #{api_call_count} completed")
                     break  # Success, exit retry loop
 
@@ -8238,6 +8313,23 @@ class AIAgent:
                     
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
+                    is_timeout_error = (
+                        classified.reason == FailoverReason.timeout
+                        or status_code == 408
+                        or error_type in (
+                            "APITimeoutError",
+                            "ReadTimeout",
+                            "ConnectTimeout",
+                            "PoolTimeout",
+                            "TimeoutException",
+                        )
+                        or "timed out" in error_msg
+                        or "timeout" in error_msg
+                    )
+                    if is_timeout_error:
+                        consecutive_timeout_failures += 1
+                    else:
+                        consecutive_timeout_failures = 0
                     _error_summary = self._summarize_api_error(api_error)
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
@@ -8375,6 +8467,17 @@ class AIAgent:
                             if self._try_activate_fallback():
                                 retry_count = 0
                                 continue
+                    if (
+                        consecutive_timeout_failures >= timeout_fallback_after
+                        and self._fallback_index < len(self._fallback_chain)
+                    ):
+                        self._emit_status(
+                            f"⚠️ Consecutive timeouts ({consecutive_timeout_failures}) — switching to fallback provider..."
+                        )
+                        if self._try_activate_fallback():
+                            retry_count = 0
+                            consecutive_timeout_failures = 0
+                            continue
 
                     is_payload_too_large = (
                         classified.reason == FailoverReason.payload_too_large
@@ -8632,10 +8735,14 @@ class AIAgent:
                             retry_count = 0
                             continue
                         # Try fallback before giving up entirely
-                        self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                        if self._try_activate_fallback():
-                            retry_count = 0
-                            continue
+                        if self._fallback_index < len(self._fallback_chain):
+                            self._emit_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                            if self._try_activate_fallback():
+                                retry_count = 0
+                                continue
+                            self._emit_status("⚠️ No usable fallback provider is configured.")
+                        else:
+                            self._emit_status("⚠️ Max retries exhausted and no fallback provider is configured.")
                         _final_summary = self._summarize_api_error(api_error)
                         if is_rate_limited:
                             self._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
@@ -8711,7 +8818,12 @@ class AIAgent:
                                     _retry_after = min(int(_ra_raw), 120)  # Cap at 2 minutes
                                 except (TypeError, ValueError):
                                     pass
-                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    wait_time = _retry_after if _retry_after else jittered_backoff(
+                        retry_count,
+                        base_delay=2.0,
+                        max_delay=float(retry_max_backoff),
+                        jitter_ratio=retry_jitter_pct,
+                    )
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limit reached. Waiting {wait_time}s before retry (attempt {retry_count + 1}/{max_retries})...")
                     else:
